@@ -1,0 +1,90 @@
+# File: .github/workflows/auto-merge-and-report.yml
+# This is a GitHub Actions workflow definition, written in YAML format.
+
+name: Auto Merge and Report Workflow  # Workflow name shown in GitHub UI
+
+# Define when this workflow should be triggered
+on:
+  push:
+    branches:
+      - auto-update-branch    # When code is pushed to the 'auto-update-branch', run this workflow
+  workflow_dispatch: {}        # Allow manual triggering via GitHub UI
+
+jobs:
+  merge-and-report:
+    # Specify the runner environment
+    runs-on: ubuntu-latest     # Use GitHub-hosted Ubuntu for all steps
+
+    steps:
+      # 1. Checkout the feature branch (auto-update-branch)
+      - name: Checkout feature branch
+        uses: actions/checkout@v3
+        with:
+          ref: auto-update-branch        # Specify the branch we want to check out
+          path: feature                  # Put its files under a sub-directory named "feature"
+
+      # 2. Checkout the main branch into a separate folder
+      - name: Checkout main branch
+        uses: actions/checkout@v3
+        with:
+          ref: main                      # Check out the main branch
+          path: main                     # Put its files under a sub-directory named "main"
+
+      # 3. Attempt to merge feature into main locally
+      - name: Attempt to merge feature into main
+        id: try-merge                   # Give this step an ID so we can reference its outputs later
+        run: |
+          cd main
+          # Add the 'feature' directory as a git remote named "feature"
+          git remote add feature ../feature
+          git fetch feature              # Download commits from auto-update-branch
+          # Try merging auto-update-branch into main
+          if git merge feature/auto-update-branch -m "Auto-merge auto-update-branch into main"; then
+            # If merge succeeds, record merged=true
+            echo "merged=true" >> $GITHUB_OUTPUT
+          else
+            # If merge fails (e.g., due to conflict), record merged=false
+            echo "merged=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true          # Even if merge fails, do not fail the entire job immediately
+
+      # 4. If merge succeeded, push updated main and generate a diff file
+      - name: Push merged main and generate diff
+        if: steps.try-merge.outputs.merged == 'true'
+        id: generate-diff
+        run: |
+          cd main
+          git push origin main            # Push merged main back to remote
+          # Generate a diff of the last commit and save it to diff.patch
+          git --no-pager diff HEAD~1 HEAD > ../diff.patch
+        # No need for continue-on-error here because if pushing or diff fails, we want to know
+
+      # 5. If merge succeeded, post or update a comment in a designated Issue with the diff
+      - name: Create or update comment with diff
+        if: steps.try-merge.outputs.merged == 'true'
+        uses: peter-evans/create-or-update-comment@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}       # GitHub automatically provides this token
+          issue-number: 1                          # Put diff into Issue #1 (change as needed)
+          body: |
+            ### Auto-merge Completed
+            The following diff shows the changes merged into `main`:
+            ```diff
+            ${{ steps.generate-diff.outputs.stdout }}  # Insert content of diff.patch here
+            ```
+
+      # 6. If merge failed (mergeable_state = dirty or actual conflict), create a new Issue to notify
+      - name: Create conflict notification Issue
+        if: steps.try-merge.outputs.merged == 'false'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "⚠️ Auto-merge failed: conflicts detected",
+              body: `Attempt to merge 'auto-update-branch' into 'main' resulted in conflicts.\n
+                     Please resolve manually.\n
+                     Related Pull Request: #${{ github.event.pull_request.number }}`
+            })
